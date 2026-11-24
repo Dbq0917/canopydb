@@ -37,6 +37,7 @@ mod wal;
 mod repr;
 mod error;
 mod group_commit;
+mod page_quota;
 mod shim;
 mod tree;
 mod write_batch;
@@ -63,6 +64,7 @@ use crate::{
     node::*,
     options::EnvDbOptions,
     page::Page,
+    page_quota::{PageQuotaLease, QuotaAdmission},
     pagetable::{Item, PageTable},
     repr::*,
     shim::{
@@ -80,6 +82,7 @@ pub use crate::{
     env::Environment,
     error::Error,
     options::{DbOptions, EnvOptions, HaltCallbackFn, TreeOptions},
+    page_quota::{PageQuota, PageQuotaConfig},
     tree::Tree,
 };
 
@@ -193,6 +196,7 @@ pub struct Transaction {
     /// Dirty nodes of a transaction
     nodes: RefCell<DirtyNodes>,
     nodes_spilled_span: Cell<PageId>,
+    page_quota: PageQuotaLease,
     /// WAL write batch (present in write tx if use_wal is enabled)
     wal_write_batch: RefCell<Option<WriteBatch>>,
     /// Scratch space
@@ -1483,6 +1487,7 @@ impl Transaction {
             scratch_buffer: RefCell::new(scratch_buffer),
             tracked_transaction,
             nodes_spilled_span: Default::default(),
+            page_quota: PageQuotaLease::new(&inner.env.page_quota),
             wal_write_batch: Default::default(),
             exclusive_write_lock,
             multi_write_lock,
@@ -1541,6 +1546,7 @@ impl Transaction {
             tracked_transaction: Some(state.metapage.tx_id),
             allocator: RefCell::new(Allocator::default()),
             scratch_buffer: Default::default(),
+            page_quota: PageQuotaLease::new(&inner.env.page_quota),
             env_handle: user_txn.then(|| inner.open.lock().clone()).flatten(),
         }))
     }
@@ -1548,6 +1554,7 @@ impl Transaction {
     fn convert_read_to_checkpoint(&mut self, _num_reserved_pages: PageId) -> Result<(), Error> {
         debug_assert!(self.flags.get().is_empty());
         self.flags.get_mut().insert(TF::CHECKPOINT_TX | TF::DIRTY);
+        self.page_quota.set_bypass(true);
         *self.nodes.get_mut() = DirtyNodes::with(
             usize::MAX,
             u64::MAX,
@@ -1676,6 +1683,7 @@ impl Transaction {
 
     fn allocate_page(&self, span: PageId, compressed: bool) -> Result<Page, Error> {
         let id = self.allocate_page_id(&mut self.allocator.borrow_mut(), span, compressed)?;
+        self.acquire_page_quota(span)?;
         let page = Page::new(id, true, span);
         let spilled = self
             .nodes
@@ -1683,6 +1691,86 @@ impl Transaction {
             .insert_with_lifecycle(id, TxNode::Popped(span as u64 * PAGE_SIZE));
         self.spill_dirty_nodes(spilled)?;
         Ok(page)
+    }
+
+    fn acquire_page_quota(&self, span: PageId) -> Result<(), Error> {
+        let quota = &self.inner.env.page_quota;
+        loop {
+            let tracked_weight = self.nodes.borrow().weight();
+            let tracked_pages = (tracked_weight / PAGE_SIZE) as PageId;
+            quota.reconcile(&self.page_quota, tracked_pages);
+            match quota.try_acquire(&self.page_quota, span) {
+                QuotaAdmission::Granted => return Ok(()),
+                QuotaAdmission::Evict => {
+                    let released = self.evict_stashed_pages_for_quota(span)?;
+                    if released != 0 {
+                        continue;
+                    }
+                    if quota.wait_for_capacity(&self.page_quota, span, quota.wait_timeout()) {
+                        continue;
+                    }
+                    // A transaction can be nested with one or more nodes popped
+                    // and therefore not evictable. Force-admit that bounded pin
+                    // depth instead of turning the page allocation into a hard
+                    // outage for the long batch.
+                    quota.force_acquire(&self.page_quota, span);
+                    return Ok(());
+                }
+                QuotaAdmission::Wait => {
+                    if quota.wait_for_capacity(&self.page_quota, span, quota.wait_timeout()) {
+                        continue;
+                    }
+                    return Err(Error::PageQuotaTimeout);
+                }
+            }
+        }
+    }
+
+    fn evict_stashed_pages_for_quota(&self, wanted: PageId) -> Result<PageId, Error> {
+        if wanted == 0 || !self.is_write_tx() {
+            return Ok(0);
+        }
+        let candidates = {
+            let nodes = self.nodes.borrow();
+            nodes
+                .iter()
+                .filter_map(|(id, node)| match node {
+                    TxNode::Stashed(inner) => Some((*id, inner.span())),
+                    _ => None,
+                })
+                .collect::<SmallVec<(PageId, PageId), 16>>()
+        };
+
+        let mut released = 0;
+        for (page_id, span) in candidates {
+            if released >= wanted {
+                break;
+            }
+            let stashed = {
+                let mut nodes = self.nodes.borrow_mut();
+                let Some(mut slot) = nodes.peek_mut(&page_id) else {
+                    continue;
+                };
+                if !matches!(*slot, TxNode::Stashed(_)) {
+                    continue;
+                }
+                mem::replace(
+                    &mut *slot,
+                    TxNode::Spilled {
+                        span,
+                        compressed_page: None,
+                    },
+                )
+            };
+            let TxNode::Stashed(node) = stashed else {
+                unreachable!("quota eviction candidate changed type");
+            };
+            let mut evicted = SmallVec::<TxNode, 1>::new();
+            evicted.push(TxNode::Stashed(node));
+            self.spill_dirty_nodes(evicted)?;
+            released += span;
+        }
+        Ok(released)
     }
 
     #[inline]
@@ -1822,10 +1910,24 @@ impl Transaction {
     #[inline]
     fn spill_dirty_nodes(&self, evicted: SmallVec<TxNode, 1>) -> Result<(), Error> {
         if evicted.is_empty() {
-            Ok(())
-        } else {
-            self.spill_dirty_nodes_cold(evicted)
+            return Ok(());
         }
+
+        let spilled_spans = evicted
+            .iter()
+            .map(|node| match node {
+                TxNode::Stashed(node) => node.span(),
+                _ => 0,
+            })
+            .collect::<SmallVec<PageId, 1>>();
+        self.spill_dirty_nodes_cold(evicted)?;
+        for spilled_span in spilled_spans {
+            self.inner
+                .env
+                .page_quota
+                .release(&self.page_quota, spilled_span);
+        }
+        Ok(())
     }
 
     #[cold]
@@ -1984,10 +2086,11 @@ impl Transaction {
             )?;
         }
 
-        let spilled = self
-            .nodes
-            .borrow_mut()
-            .insert_with_lifecycle(node_mut.id(), TxNode::Popped(node_mut.page_size() as u64));
+        self.acquire_page_quota(node_mut.span())?;
+        let spilled = self.nodes.borrow_mut().insert_with_lifecycle(
+            node_mut.id(),
+            TxNode::Popped(node_mut.span() as u64 * PAGE_SIZE),
+        );
         self.spill_dirty_nodes(spilled)?;
         Ok(node_mut)
     }
@@ -3794,7 +3897,7 @@ impl DirtyNodeWeighter {
     #[inline]
     fn weight(val: &TxNode) -> u64 {
         match val {
-            TxNode::Stashed(n) => n.page_size() as u64,
+            TxNode::Stashed(n) => n.span() as u64 * PAGE_SIZE,
             TxNode::Popped(n) => *n,
             TxNode::Spilled { .. } | TxNode::Freed { .. } => 0,
         }

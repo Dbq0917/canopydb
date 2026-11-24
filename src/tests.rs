@@ -640,6 +640,160 @@ fn multi_writer() {
 }
 
 #[test]
+fn fair_page_quota_keeps_small_txns_working_during_large_txn() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let _ = env_logger::try_init();
+    let _f = test_folder();
+    let mut env_opts = EnvOptions::new(_f.path());
+    env_opts.disable_fsync = true;
+    env_opts.page_cache_size = 64 * PAGE_SIZE as usize;
+    let env = Arc::new(Environment::with_options(env_opts).unwrap());
+    assert_eq!(env.inner.page_quota.capacity_pages(), 64);
+    assert_eq!(env.inner.page_quota.reserved_pages(), 16);
+    let bulk_db = Arc::new(env.get_or_create_database("month_end_interest").unwrap());
+    let small_db = Arc::new(env.get_or_create_database("online").unwrap());
+
+    for db in [&bulk_db, &small_db] {
+        let tx = db.begin_write().unwrap();
+        tx.get_or_create_tree(b"accounts").unwrap();
+        tx.commit().unwrap();
+    }
+
+    let large_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let small_failures = Arc::new(AtomicU32::new(0));
+    let small_successes = Arc::new(AtomicU32::new(0));
+    let write_conflicts = Arc::new(AtomicU32::new(0));
+
+    std::thread::scope(|scope| {
+        let bulk_db = bulk_db.clone();
+        let bulk_ready = large_ready.clone();
+        let bulk_successes = small_successes.clone();
+        let bulk_handle = scope.spawn(move || -> Result<(), Error> {
+            let tx = bulk_db.begin_write_concurrent()?;
+            let mut tree = tx.get_or_create_tree(b"accounts")?;
+            for account in 0..2_000u32 {
+                let key = format!("interest:{account:08}");
+                tree.insert(key.as_bytes(), &[b'i'; 512])?;
+                if !bulk_ready.load(Ordering::Acquire)
+                    && bulk_db.inner.env.page_quota.used_pages() >= 48
+                {
+                    bulk_ready.store(true, Ordering::Release);
+                    let wait_start = Instant::now();
+                    while bulk_successes.load(Ordering::Acquire) < 8 {
+                        if wait_start.elapsed() > Duration::from_secs(10) {
+                            return Err(Error::io_other(
+                                "small transactions did not progress while bulk tx held quota",
+                            ));
+                        }
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }
+            drop(tree);
+            tx.commit()?;
+            Ok(())
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !large_ready.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "large tx did not fill quota in time"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let mut small_handles = Vec::new();
+        for worker in 0..4u32 {
+            let small_db = small_db.clone();
+            let small_failures = small_failures.clone();
+            let small_successes = small_successes.clone();
+            let write_conflicts = write_conflicts.clone();
+            small_handles.push(scope.spawn(move || {
+                for sequence in 0..25u32 {
+                    let mut attempts = 0u32;
+                    loop {
+                        let tx = match small_db.begin_write_concurrent() {
+                            Ok(tx) => tx,
+                            Err(error) => {
+                                eprintln!("small tx begin failed: {error}");
+                                small_failures.fetch_add(1, Ordering::Relaxed);
+                                break;
+                            }
+                        };
+                        let mut tree = match tx.get_or_create_tree(b"accounts") {
+                            Ok(tree) => tree,
+                            Err(error) => {
+                                eprintln!("small tx tree failed: {error}");
+                                small_failures.fetch_add(1, Ordering::Relaxed);
+                                break;
+                            }
+                        };
+                        let key = format!("payment:{worker:02}:{sequence:04}:{attempts:04}");
+                        if let Err(error) = tree.insert(key.as_bytes(), b"ok") {
+                            eprintln!("small tx insert failed: {error}");
+                            small_failures.fetch_add(1, Ordering::Relaxed);
+                            break;
+                        }
+                        drop(tree);
+                        match tx.commit() {
+                            Ok(_) => {
+                                small_successes.fetch_add(1, Ordering::Release);
+                                break;
+                            }
+                            Err(Error::WriteConflict) if attempts < 100 => {
+                                attempts += 1;
+                                write_conflicts.fetch_add(1, Ordering::Relaxed);
+                                thread::yield_now();
+                            }
+                            Err(error) => {
+                                eprintln!("small tx commit failed: {error}");
+                                small_failures.fetch_add(1, Ordering::Relaxed);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+
+        for handle in small_handles {
+            handle.join().unwrap();
+        }
+        bulk_handle.join().unwrap().unwrap();
+    });
+
+    let peak_quota_pages = env.inner.page_quota.peak_used_pages();
+    let small_failure_count = small_failures.load(Ordering::Relaxed);
+    let small_success_count = small_successes.load(Ordering::Relaxed);
+    let conflict_count = write_conflicts.load(Ordering::Relaxed);
+    eprintln!("peak page quota usage: {peak_quota_pages}/64");
+    eprintln!(
+        "small transactions: {small_success_count} committed, \
+         {small_failure_count} failed, {conflict_count} write conflicts retried"
+    );
+    assert!(
+        peak_quota_pages >= 49,
+        "large tx did not pressure the fair quota (peak {peak_quota_pages})"
+    );
+    assert_eq!(
+        small_failure_count, 0,
+        "small transactions failed; write conflicts retried: {}",
+        conflict_count,
+    );
+
+    let read_tx = bulk_db.begin_read().unwrap();
+    let tree = read_tx.get_tree(b"accounts").unwrap().unwrap();
+    assert_eq!(tree.len(), 2_000u64);
+    drop(tree);
+    drop(read_tx);
+    drop(bulk_db);
+    drop(small_db);
+    Arc::try_unwrap(env).unwrap().drop_wait();
+}
+
+#[test]
 fn read_tx_snapshot_works() {
     let _ = env_logger::try_init();
     let mut rng = get_rng();

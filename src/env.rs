@@ -11,6 +11,7 @@ use crate::{
     hash_map,
     node::UntypedNode,
     options::{DbOptions, EnvDbOptions, EnvOptions},
+    page_quota::{PageQuota, PageQuotaConfig},
     repr::{DbId, PageId, TxId},
     shim::{
         parking_lot::Mutex,
@@ -67,6 +68,7 @@ pub(crate) struct EnvironmentInner {
     open_dbs: Arc<Mutex<BTreeMap<String, WeakDatabaseInner>>>,
     pub wal: Arc<Wal>,
     pub shared_cache: SharedCache,
+    pub page_quota: Arc<PageQuota>,
     bg_tx: sync::mpsc::SyncSender<sync::mpsc::Sender<()>>,
     bg_thread: OnceLock<Arc<SharedJoinHandle<Result<(), Error>>>>,
     pub opts: Arc<EnvOptions>,
@@ -398,6 +400,13 @@ impl Environment {
         }
         let wal = Arc::new(Wal::new(opts.path.clone())?);
         let (bg_tx, bg_rx) = sync::mpsc::sync_channel(64);
+        let page_quota = opts
+            .page_quota
+            .clone()
+            .unwrap_or_else(|| {
+                PageQuotaConfig::for_page_cache_size(opts.page_cache_size, PAGE_SIZE)
+            })
+            .build();
         let inner = Arc::new(EnvironmentInner {
             closed: Default::default(),
             halted: Default::default(),
@@ -415,6 +424,7 @@ impl Environment {
                 Default::default(),
                 Default::default(),
             ),
+            page_quota,
             opts: opts.clone(),
             bg_tx,
             bg_thread: Default::default(),

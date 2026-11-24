@@ -1,6 +1,7 @@
 #[cfg_attr(fuzzing, allow(unused_imports))]
 use crate::{
     error::{error_validation, Error},
+    page_quota::PageQuotaConfig,
     repr::{TreeId, TreeValue},
     shim::parking_lot::Mutex,
     utils, PAGE_SIZE,
@@ -90,6 +91,14 @@ pub struct EnvOptions {
     ///
     /// Default: `1 GB`
     pub page_cache_size: usize,
+    /// Fair quota for pages pinned by in-flight write transactions.
+    ///
+    /// When `None`, the quota capacity is derived from [`EnvOptions::page_cache_size`].
+    /// Set this explicitly to model a smaller fixed page pool or to tune the
+    /// small-transaction reserve and wait timeout.
+    ///
+    /// Default: `None`
+    pub page_quota: Option<PageQuotaConfig>,
 }
 
 #[derive(Debug, Deref)]
@@ -188,6 +197,7 @@ impl EnvOptions {
             wait_bg_threads_on_drop: true,
             wal_write_batch_memory_limit: 8 * 1024 * 1024,
             page_cache_size: 1024 * 1024 * 1024,
+            page_quota: None,
             wal_new_file_on_checkpoint: true,
             file_lock_timeout: Duration::from_secs(5),
         }

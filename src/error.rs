@@ -23,6 +23,7 @@ pub enum Error {
     WriteTransactionRequired,
     CantCompact,
     WriteConflict,
+    PageQuotaTimeout,
 }
 
 impl Error {
@@ -59,6 +60,7 @@ impl Error {
             Self::WriteTransactionRequired => Self::WriteTransactionRequired,
             Self::CantCompact => Self::CantCompact,
             Self::WriteConflict => Self::WriteConflict,
+            Self::PageQuotaTimeout => Self::PageQuotaTimeout,
         }
     }
 }
