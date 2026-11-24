@@ -19,6 +19,12 @@ const SHARD_MAX_LEN: PageId = if cfg!(fuzzing) {
     u16::MAX as PageId + 1
 };
 
+/// How many ranges to inspect on each side of the target page when looking for
+/// a nearby allocation. This keeps the common case fast even when a shard is
+/// fragmented, while still allowing a nearby range to be found after a few
+/// size-class misses.
+const NEAR_ALLOCATION_SCAN: usize = 32;
+
 /// SHARD_MAX_LEN can only be up to 2**16 due to u16 being used throughout to save space.
 const _: () = assert!(SHARD_MAX_LEN <= u16::MAX as PageId + 1);
 
@@ -42,6 +48,10 @@ pub struct DeferredFreelist {
 }
 
 impl DeferredFreelist {
+    pub fn allocate_near(&mut self, span: PageId, target: PageId) -> Result<Option<PageId>, Error> {
+        Ok(self.merged()?.allocate_near(span, target))
+    }
+
     pub fn bulk_allocate(
         &mut self,
         min_span: PageId,
@@ -410,6 +420,49 @@ impl Shard {
             };
         }
         Some(self.base + r.page())
+    }
+
+    fn allocate_near(&mut self, span: PageId, target: PageId) -> Option<PageId> {
+        debug_assert!(span > 0);
+        debug_assert!(span <= SHARD_MAX_LEN);
+        if !self.hist.any_gte((span - 1) as u16) {
+            return None;
+        }
+
+        let target = target.clamp(self.base, self.base + SHARD_MAX_LEN - 1) - self.base;
+        let ranges = &*self.ranges;
+        let pos = ranges.partition_point(|r| r.page() > target);
+
+        let mut best: Option<(PageId, PageId)> = None;
+        let mut consider = |start: PageId| {
+            let distance = start.abs_diff(target);
+            if best.is_none_or(|(best_distance, _)| distance < best_distance) {
+                best = Some((distance, start));
+            }
+        };
+
+        // Pages above the target, nearest first.
+        for r in ranges[..pos].iter().rev().take(NEAR_ALLOCATION_SCAN) {
+            if r.span() >= span {
+                consider(r.page());
+                break;
+            }
+        }
+
+        // Pages below the target, nearest first. Allocate the high end of the
+        // range so the result is as close as possible to the target.
+        for r in ranges[pos..].iter().take(NEAR_ALLOCATION_SCAN) {
+            if r.span() >= span {
+                let start = target.clamp(r.page(), r.page_end() - span);
+                consider(start);
+                break;
+            }
+        }
+
+        let (_, page) = best?;
+        let span_removed = self.remove(self.base + page, span);
+        debug_assert_eq!(span_removed, span);
+        Some(self.base + page)
     }
 
     #[cfg(not(feature = "nightly"))]
@@ -985,6 +1038,46 @@ impl Freelist {
         result
     }
 
+    /// Allocates a span as close as possible to `target`, without changing the
+    /// freelist representation. Returns `None` when no suitable span exists.
+    pub fn allocate_near(&mut self, span: PageId, target: PageId) -> Option<PageId> {
+        if span == 0 || span > SHARD_MAX_LEN || self.is_empty() {
+            return None;
+        }
+        let shards = Arc::make_mut(self.shards.as_mut()?);
+        let target_shard = target / SHARD_MAX_LEN * SHARD_MAX_LEN;
+        let pos = shards.partition_point(|s| s.base < target_shard);
+        let mut below = pos;
+        let mut above = pos;
+
+        while below != 0 || above != shards.len() {
+            let choose_below = match (below != 0, above != shards.len()) {
+                (true, false) => true,
+                (false, true) => false,
+                (true, true) => {
+                    let below_end = shards[below - 1].base.saturating_add(SHARD_MAX_LEN - 1);
+                    target.saturating_sub(below_end) <= shards[above].base.saturating_sub(target)
+                }
+                (false, false) => unreachable!(),
+            };
+            let index = if choose_below {
+                below -= 1;
+                below
+            } else {
+                let index = above;
+                above += 1;
+                index
+            };
+            if let Some(page) = shards[index].allocate_near(span, target) {
+                if shards[index].is_empty() {
+                    shards.remove(index);
+                }
+                return Some(page);
+            }
+        }
+        None
+    }
+
     pub fn remove(&mut self, mut page_id: PageId, mut span: PageId) -> PageId {
         #[cfg(debug_assertions)]
         let len_before = self.len();
@@ -1091,6 +1184,38 @@ mod tests {
         assert_eq!(a.allocate(1), Some(SHARD_MAX_LEN));
         a.free(1, SHARD_MAX_LEN - 1).unwrap();
         assert_eq!(a.allocate(SHARD_MAX_LEN - 1), Some(1));
+    }
+
+    #[test]
+    fn test_allocate_near() {
+        let freelist = || {
+            let mut a = Freelist::default();
+            a.free(100, 10).unwrap();
+            a.free(1_000, 10).unwrap();
+            a.free(5_000, 10).unwrap();
+            a
+        };
+
+        let mut a = freelist();
+        assert_eq!(a.allocate_near(1, 1_100), Some(1_009));
+        assert_eq!(a.allocate_near(1, 1_100), Some(1_008));
+        assert_eq!(a.allocate_near(2, 500), Some(108));
+        assert_eq!(a.allocate_near(1, 105), Some(105));
+        assert_eq!(a.allocate_near(20, 1_000), None);
+        assert_eq!(a.allocate_near(SHARD_MAX_LEN + 1, 1_000), None);
+        assert!(a.validate());
+    }
+
+    #[test]
+    fn test_allocate_near_other_shard() {
+        let mut a = Freelist::default();
+        a.free(70_000, 10).unwrap();
+        a.free(140_000, 10).unwrap();
+        assert_eq!(a.allocate_near(1, 69_000), Some(70_000));
+        assert_eq!(a.allocate_near(1, 100), Some(70_001));
+        assert_eq!(a.allocate_near(8, 70_000), Some(70_002));
+        assert_eq!(a.allocate_near(1, 70_000), Some(140_000));
+        assert!(a.validate());
     }
 
     #[test]

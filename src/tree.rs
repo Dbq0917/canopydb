@@ -324,6 +324,7 @@ impl<'tx> Tree<'tx> {
             guard.disarm();
             return Ok(());
         }
+        self.tx.set_allocation_anchor(PageId::default());
         *self.cached_root.get_mut() = None;
         self.tx.mark_dirty();
         if self.name.is_some() {
@@ -375,6 +376,7 @@ impl<'tx> Tree<'tx> {
         }
         self.validate_key_value_lengths(key, value)?;
 
+        self.tx.set_allocation_anchor(PageId::default());
         *self.cached_root.get_mut() = None;
         self.tx.mark_dirty();
         if self.name.is_some() {
@@ -390,6 +392,8 @@ impl<'tx> Tree<'tx> {
         let value = &(match value {
             Some(b) if b.len() <= MAX_INLINE_VALUE_LEN => MaybeValue::Bytes(b),
             Some(b) => {
+                self.tx
+                    .set_allocation_anchor(self.overflow_allocation_anchor(key)?);
                 let bytes_v = MaybeValue::Bytes(b);
                 let required_size = LeafNode::<false>::leaf_size_for(&self.value, 0, b"", &bytes_v);
                 let overflow_page = self.allocate_node(required_size, None)?;
@@ -529,6 +533,27 @@ impl<'tx> Tree<'tx> {
         self.tx.allocate_page(span, compressed)
     }
 
+    fn overflow_allocation_anchor(&self, key: &[u8]) -> Result<PageId, Error> {
+        let mut node_id = self.value.root;
+        if node_id == PageId::default() {
+            return Ok(PageId::default());
+        }
+        loop {
+            let node = self.tx.clone_node(node_id)?;
+            if node.is_leaf() {
+                let leaf = node.as_leaf();
+                return Ok(match leaf.search_keys(key) {
+                    Ok(i) => match leaf.value_at(i) {
+                        MaybeValue::Overflow([page_id, _]) => page_id,
+                        _ => node.id(),
+                    },
+                    Err(_) => node.id(),
+                });
+            }
+            (_, node_id) = node.as_branch().search_child(key);
+        }
+    }
+
     fn node_mutate(
         tree: &mut Tree,
         parent_prefix: &NodePrefix<'_>,
@@ -537,6 +562,7 @@ impl<'tx> Tree<'tx> {
         value: &MaybeValue,
     ) -> Result<MutateResult, Error> {
         let node = tree.tx.pop_node(node_id)?;
+        tree.tx.set_allocation_anchor(node_id);
         if node.is_leaf() {
             Self::leaf_mutate(tree, parent_prefix, Node::into_leaf(node), full_key, value)
         } else {
@@ -1588,6 +1614,7 @@ fn remove_range_node(
     }
 
     let node = tree.tx.pop_node(node_id)?;
+    tree.tx.set_allocation_anchor(node_id);
     if node.is_leaf() {
         let mut node = node.into_leaf();
         let start_i = search_bound(&node, start, false);

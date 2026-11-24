@@ -1667,6 +1667,117 @@ fn print_tree_node_stats(tree: &Tree) {
     );
 }
 
+fn key_pages(tree: &Tree, needle: &[u8]) -> Option<(PageId, Option<PageId>)> {
+    let mut result = None;
+    tree.iter_nodes(&mut |node| {
+        if result.is_some() || !node.is_leaf() {
+            return;
+        }
+        let leaf = node.as_leaf();
+        for i in 0..leaf.num_keys() {
+            if leaf.full_key_at(i).as_ref() == needle {
+                let overflow = match leaf.value_at(i) {
+                    MaybeValue::Overflow([page_id, _]) => Some(page_id),
+                    _ => None,
+                };
+                result = Some((node.id(), overflow));
+                break;
+            }
+        }
+    })
+    .unwrap();
+    result
+}
+
+#[test]
+fn hot_key_cow_pages_stay_near() {
+    let _ = env_logger::try_init();
+    let folder = test_folder();
+    let mut db_opts = DbOptions::new();
+    db_opts.checkpoint_interval = Duration::MAX;
+    let db = Database::with_options(EnvOptions::new(folder.path()), db_opts).unwrap();
+
+    let value = vec![0x5a; 8 * 1024];
+    let key = |i: u64| i.to_be_bytes();
+    let hot_key = key(0);
+    let mut rng = SmallRng::seed_from_u64(7);
+
+    let tx = db.begin_write().unwrap();
+    let mut tree = tx.get_or_create_tree(b"ledger").unwrap();
+    for i in 0..64 {
+        tree.insert(&key(i), &value).unwrap();
+    }
+    drop(tree);
+    tx.commit().unwrap();
+    db.checkpoint().unwrap();
+
+    // Move all keys once so the previous generation becomes free after the
+    // next checkpoint, leaving holes throughout the file.
+    let tx = db.begin_write().unwrap();
+    let mut tree = tx.get_or_create_tree(b"ledger").unwrap();
+    for i in 0..64 {
+        tree.insert(&key(i), &value).unwrap();
+    }
+    drop(tree);
+    tx.commit().unwrap();
+    db.checkpoint().unwrap();
+
+    let mut previous: Option<(PageId, Option<PageId>)> = None;
+    let mut max_leaf_jump = 0;
+    let mut max_overflow_jump = 0;
+    let mut leaf_jump_sum = 0u64;
+    let mut overflow_jump_sum = 0u64;
+    let mut jumps = 0u64;
+    for round in 0..64 {
+        let tx = db.begin_write().unwrap();
+        let mut tree = tx.get_or_create_tree(b"ledger").unwrap();
+        for _ in 0..16 {
+            let cold_key = key(rng.random_range(1..64));
+            tree.insert(&cold_key, &value).unwrap();
+        }
+        tree.insert(&hot_key, &value).unwrap();
+        drop(tree);
+        tx.commit().unwrap();
+
+        if round % 4 == 3 {
+            db.checkpoint().unwrap();
+        }
+
+        let tx = db.begin_read().unwrap();
+        let tree = tx.get_tree(b"ledger").unwrap().unwrap();
+        let current = key_pages(&tree, &hot_key).unwrap();
+        if round > 2 {
+            let (previous_leaf, previous_overflow) = previous.unwrap();
+            let (leaf, overflow) = current;
+            let leaf_jump = leaf.abs_diff(previous_leaf);
+            max_leaf_jump = max_leaf_jump.max(leaf_jump);
+            leaf_jump_sum += leaf_jump as u64;
+            jumps += 1;
+            if let (Some(overflow), Some(previous_overflow)) = (overflow, previous_overflow) {
+                let overflow_jump = overflow.abs_diff(previous_overflow);
+                max_overflow_jump = max_overflow_jump.max(overflow_jump);
+                overflow_jump_sum += overflow_jump as u64;
+            }
+        }
+        previous = Some(current);
+    }
+    println!(
+        "max hot leaf jump {max_leaf_jump}, overflow {max_overflow_jump}; avg leaf {}, overflow {}",
+        leaf_jump_sum / jumps,
+        overflow_jump_sum / jumps
+    );
+    let average_leaf_jump = leaf_jump_sum / jumps;
+    let average_overflow_jump = overflow_jump_sum / jumps;
+    assert!(
+        average_leaf_jump <= 8,
+        "hot leaf jumped {average_leaf_jump} pages on average (max {max_leaf_jump})"
+    );
+    assert!(
+        average_overflow_jump <= 64,
+        "hot overflow jumped {average_overflow_jump} pages on average (max {max_overflow_jump})"
+    );
+}
+
 struct TestGuard {
     sys: sysinfo::System,
     start: Instant,

@@ -265,6 +265,43 @@ impl Allocator {
         }
     }
 
+    fn take_from_main_near(
+        &mut self,
+        span: PageId,
+        anchor: PageId,
+    ) -> Result<Option<PageId>, Error> {
+        let mut main = self.main.as_ref().unwrap().lock();
+        let allocation = main.free.allocate_near(span, anchor)?;
+        if let Some(allocation) = allocation {
+            self.all_allocations.free(allocation, span)?;
+            if self.is_checkpointer {
+                self.externally_allocated.remove(allocation, span);
+            }
+            self.main_next_page_id = main.next_page_id;
+        }
+        Ok(allocation)
+    }
+
+    /// Allocates `span` pages close to `anchor`. Falls back to the regular
+    /// allocation path when no nearby span can be found.
+    pub fn allocate_near(&mut self, span: PageId, anchor: PageId) -> Result<PageId, Error> {
+        let mut bulk = None;
+        loop {
+            if let Some(id) = self.take_from_main_near(span, anchor)? {
+                return Ok(id);
+            }
+            if let Some(id) = self.free.allocate_near(span, anchor) {
+                return Ok(id);
+            }
+            let bulk = bulk.get_or_insert_with(|| {
+                span > Self::ALLOCATION_BATCH as PageId / 10
+                    || self.free.len() < Self::ALLOCATION_BATCH as PageId
+            });
+            self.reserve_from_main(span, *bulk)?;
+            *bulk = false;
+        }
+    }
+
     #[cold]
     fn reserve_indirections_from_main(&mut self) -> Result<(), Error> {
         let mut main = self.main.as_ref().unwrap().lock();

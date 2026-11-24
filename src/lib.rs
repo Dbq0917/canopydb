@@ -188,6 +188,8 @@ pub struct Transaction {
     inner: ManuallyDrop<SharedDatabaseInner>,
     state: Cell<DatabaseState>,
     allocator: RefCell<Allocator>,
+    /// Page to keep nearby when allocating a COW replacement. `0` means no hint.
+    allocation_anchor: Cell<PageId>,
     /// Trees opened/deleted by the transaction
     trees: RefCell<HashMap<Arc<[u8]>, TreeState>>,
     /// Dirty nodes of a transaction
@@ -1476,6 +1478,7 @@ impl Transaction {
             flags: Cell::new(flags),
             trap: Default::default(),
             allocator: RefCell::new(allocator),
+            allocation_anchor: Default::default(),
             inner: ManuallyDrop::new(inner.clone()),
             state: Cell::new(state),
             trees: RefCell::new(trees.unwrap_or_default()),
@@ -1533,6 +1536,7 @@ impl Transaction {
             state: Cell::new(state),
             trees: Default::default(),
             nodes: RefCell::new(void_dirty_cache()),
+            allocation_anchor: Default::default(),
             nodes_spilled_span: Default::default(),
             wal_write_batch: None.into(),
             exclusive_write_lock: None,
@@ -1668,10 +1672,19 @@ impl Transaction {
             trace!("allocated indirection {page_id}");
             Ok(page_id)
         } else {
-            let page_id = allocator.allocate(span)?;
+            let anchor = self.allocation_anchor.get();
+            let page_id = if anchor == PageId::default() {
+                allocator.allocate(span)?
+            } else {
+                allocator.allocate_near(span, anchor)?
+            };
             trace!("allocated {page_id}");
             Ok(page_id)
         }
+    }
+
+    pub(crate) fn set_allocation_anchor(&self, anchor: PageId) {
+        self.allocation_anchor.set(anchor);
     }
 
     fn allocate_page(&self, span: PageId, compressed: bool) -> Result<Page, Error> {
@@ -1977,6 +1990,7 @@ impl Transaction {
                 },
             );
             self.spill_dirty_nodes(spilled)?;
+            self.allocation_anchor.set(node_mut.id());
             node_mut.node_header_mut().page_header.id = self.allocate_page_id(
                 &mut self.allocator.borrow_mut(),
                 node_mut.span(),
@@ -3025,7 +3039,7 @@ impl DatabaseInner {
         page_bytes.truncate(
             compressed_span as usize * PAGE_SIZE as usize - size_of::<ReservedPageHeader>(),
         );
-        let compressed_page_id = allocator.allocate(compressed_span)?;
+        let compressed_page_id = allocator.allocate_near(compressed_span, page.id())?;
 
         trace!(
             "Compressing page {} -> {}, ratio {:.2}x, effective {:.2}x, {} -> {} pages",
