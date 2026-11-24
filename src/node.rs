@@ -8,6 +8,7 @@ use std::{
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::{
+    error::io_invalid_data,
     page::Page,
     repr::{
         header_cast, header_cast_mut, BranchHeader, BranchKeyRepr, HeaderProvider, LeafHeader,
@@ -953,6 +954,165 @@ impl UntypedNode {
             page,
             ty: std::marker::PhantomData,
         })
+    }
+
+    /// Validates that all header fields and key/value offsets are inside the page.
+    ///
+    /// Accessors such as [`Node::key_at`] assume a well formed node. The integrity checker
+    /// calls this first so that corrupted metadata is reported as an error instead of causing
+    /// an out of bounds slice or a panic.
+    pub(crate) fn validate_layout(&self) -> Result<(), Error> {
+        let header = *self.node_header();
+        let page_id = header.page_header.id;
+        let page_len = self.page.data().len();
+        let is_leaf = header.level == 0;
+        let static_header_size = if is_leaf {
+            size_of::<LeafHeader>()
+        } else {
+            size_of::<BranchHeader>()
+        };
+        let prefix_len = header.key_prefix_len as usize;
+        let header_size = static_header_size
+            .checked_add(prefix_len)
+            .ok_or_else(|| io_invalid_data!("Node {page_id} header size overflow"))?;
+        if header_size > page_len {
+            return Err(io_invalid_data!(
+                "Node {page_id} header ({header_size} bytes) exceeds page ({page_len} bytes)"
+            ));
+        }
+        let tail_curr_size = header.tail_curr_size as usize;
+        let tail_real_size = header.tail_real_size as usize;
+        if tail_curr_size < tail_real_size {
+            return Err(io_invalid_data!(
+                "Node {page_id} real tail is larger than its current size"
+            ));
+        }
+        let tail_start = page_len
+            .checked_sub(tail_curr_size)
+            .ok_or_else(|| io_invalid_data!("Node {page_id} tail exceeds the page"))?;
+
+        let num_keys = header.num_keys as usize;
+        if num_keys == 0 {
+            return Err(io_invalid_data!("Node {page_id} has no keys"));
+        }
+        let n_var = if is_leaf { 2 } else { 1 };
+        let repr_size = if is_leaf {
+            size_of::<LeafPairRepr>()
+        } else {
+            size_of::<BranchKeyRepr>()
+        };
+
+        let head_len;
+        if header.fixed_key_len < 0 {
+            if is_leaf && header.fixed_value_len >= 0 {
+                return Err(io_invalid_data!(
+                    "Node {page_id} mixes variable keys with fixed values"
+                ));
+            }
+            let offsets_len = num_keys
+                .checked_mul(size_of::<Offset>())
+                .ok_or_else(|| io_invalid_data!("Node {page_id} offset table overflow"))?;
+            head_len = header_size
+                .checked_add(offsets_len)
+                .ok_or_else(|| io_invalid_data!("Node {page_id} offset table overflow"))?;
+            if head_len > page_len {
+                return Err(io_invalid_data!("Node {page_id} offset table exceeds page"));
+            }
+            let offsets = <[Offset]>::ref_from_bytes(&self.page.data()[header_size..head_len])
+                .map_err(|_| io_invalid_data!("Node {page_id} invalid offset table"))?;
+            for (i, offset) in offsets.iter().enumerate() {
+                let start = offset.offset as usize;
+                let var_len = size_of::<VarRepr>() * n_var;
+                let var_end = start
+                    .checked_add(var_len)
+                    .ok_or_else(|| io_invalid_data!("Node {page_id} entry {i} overflow"))?;
+                if start < head_len || start < tail_start || var_end > page_len {
+                    return Err(io_invalid_data!(
+                        "Node {page_id} entry {i} offset {start} is outside the tail"
+                    ));
+                }
+                let var_reprs = <[VarRepr]>::ref_from_bytes(&self.page.data()[start..var_end])
+                    .map_err(|_| io_invalid_data!("Node {page_id} entry {i} invalid lengths"))?;
+                let mut entry_end = var_end
+                    .checked_add(repr_size)
+                    .ok_or_else(|| io_invalid_data!("Node {page_id} entry {i} overflow"))?;
+                let mut key_len = 0;
+                let mut value_len = 0;
+                for (var_idx, var_repr) in var_reprs.iter().enumerate() {
+                    let len = var_repr.len as usize;
+                    if var_idx == 0 {
+                        key_len = len;
+                    } else {
+                        value_len = len;
+                    }
+                    entry_end = entry_end
+                        .checked_add(len)
+                        .ok_or_else(|| io_invalid_data!("Node {page_id} entry {i} overflow"))?;
+                }
+                if entry_end > page_len {
+                    return Err(io_invalid_data!(
+                        "Node {page_id} entry {i} extends past the end of the page"
+                    ));
+                }
+                let key = &self.page.data()[var_end + repr_size..var_end + repr_size + key_len];
+                if { offset.prefix } != read_prefix_u32(key) {
+                    return Err(io_invalid_data!(
+                        "Node {page_id} entry {i} has a mismatched prefix"
+                    ));
+                }
+                if is_leaf {
+                    let repr = &self.page.data()[var_end..var_end + repr_size];
+                    let repr = LeafPairRepr::ref_from_bytes(repr)
+                        .map_err(|_| io_invalid_data!("Node {page_id} entry {i} invalid flags"))?;
+                    if repr.is_overflow() && value_len != size_of::<[PageId; 2]>() {
+                        return Err(io_invalid_data!(
+                            "Node {page_id} entry {i} has an invalid overflow value length"
+                        ));
+                    }
+                }
+            }
+        } else {
+            let fixed_key_len = header.fixed_key_len as usize;
+            let fixed_value_len = if is_leaf {
+                if header.fixed_value_len < 0 {
+                    return Err(io_invalid_data!(
+                        "Node {page_id} mixes fixed keys with variable values"
+                    ));
+                }
+                header.fixed_value_len as usize
+            } else {
+                0
+            };
+            let unit_size = repr_size
+                .checked_add(fixed_key_len)
+                .and_then(|v| v.checked_add(fixed_value_len))
+                .ok_or_else(|| io_invalid_data!("Node {page_id} entry size overflow"))?;
+            let entries_len = num_keys
+                .checked_mul(unit_size)
+                .ok_or_else(|| io_invalid_data!("Node {page_id} entry table overflow"))?;
+            head_len = header_size
+                .checked_add(entries_len)
+                .ok_or_else(|| io_invalid_data!("Node {page_id} entry table overflow"))?;
+            if head_len > page_len {
+                return Err(io_invalid_data!(
+                    "Node {page_id} fixed entry table exceeds page"
+                ));
+            }
+        }
+
+        if head_len
+            .checked_add(tail_curr_size)
+            .is_none_or(|v| v > page_len)
+            || head_len
+                .checked_add(tail_real_size)
+                .is_none_or(|v| v > page_len)
+        {
+            return Err(io_invalid_data!(
+                "Node {page_id} head and tail overlap the end of the page"
+            ));
+        }
+
+        Ok(())
     }
 }
 

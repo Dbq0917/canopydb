@@ -31,6 +31,131 @@ fn is_github_actions() -> bool {
     std::env::var("GITHUB_WORKFLOW").is_ok()
 }
 
+#[test]
+fn online_integrity_check_runs_with_concurrent_io() {
+    let _ = env_logger::try_init();
+    let _f = test_folder();
+    let mut env_opts = EnvOptions::new(_f.path());
+    env_opts.use_checksums = true;
+    let mut db_opts = DbOptions::new();
+    db_opts.checkpoint_target_size = 2 * 1024 * 1024;
+    db_opts.throttle_memory_limit = 4 * 1024 * 1024;
+    db_opts.stall_memory_limit = 8 * 1024 * 1024;
+    let db = Arc::new(Database::with_options(env_opts, db_opts).unwrap());
+
+    let tx = db.begin_write().unwrap();
+    let mut tree = tx.get_or_create_tree(b"default").unwrap();
+    for i in 0..2_000u32 {
+        tree.insert(&i.to_be_bytes(), &[i as u8; 32]).unwrap();
+    }
+    let overflow = vec![7u8; 32 * 1024];
+    tree.insert(b"overflow", &overflow).unwrap();
+    drop(tree);
+    let mut fixed_opts = TreeOptions::new();
+    fixed_opts.fixed_key_len = 8;
+    fixed_opts.fixed_value_len = 16;
+    let mut fixed = tx.get_or_create_tree_with(b"fixed", fixed_opts).unwrap();
+    for i in 0..500u64 {
+        fixed.insert(&i.to_be_bytes(), &[i as u8; 16]).unwrap();
+    }
+    drop(fixed);
+    let mut temp = tx.get_or_create_tree(b"temp").unwrap();
+    temp.insert(b"a", b"b").unwrap();
+    drop(temp);
+    tx.rename_tree(b"temp", b"renamed").unwrap();
+    tx.delete_tree(b"renamed").unwrap();
+    tx.commit().unwrap();
+    db.checkpoint().unwrap();
+
+    let tx = db.begin_write().unwrap();
+    let mut tree = tx.get_or_create_tree(b"default").unwrap();
+    for i in 0..2_000u32 {
+        tree.insert(&i.to_be_bytes(), &[i as u8; 8]).unwrap();
+    }
+    tree.delete_range(500u32.to_be_bytes()..1_000u32.to_be_bytes())
+        .unwrap();
+    drop(tree);
+    tx.commit().unwrap();
+    db.check_integrity().unwrap();
+
+    let writer_db = db.clone();
+    let writer = thread::spawn(move || {
+        for seq in 0..50u32 {
+            let tx = writer_db.begin_write().unwrap();
+            let mut tree = tx.get_or_create_tree(b"default").unwrap();
+            for i in 0..20u32 {
+                let key = (seq * 20 + i).to_be_bytes();
+                tree.insert(&key, &[seq as u8; 64]).unwrap();
+            }
+            tree.delete(&0u32.to_be_bytes()).unwrap();
+            drop(tree);
+            tx.commit().unwrap();
+            let rx = writer_db.begin_read().unwrap();
+            let tree = rx.get_tree(b"default").unwrap().unwrap();
+            assert!(tree.get(&0u32.to_be_bytes()).unwrap().is_none());
+        }
+    });
+
+    for _ in 0..10 {
+        db.check_integrity().unwrap();
+    }
+    writer.join().unwrap();
+    let report = db.check_integrity_report().unwrap();
+    assert_eq!(report.trees_checked, 2);
+    assert!(report.keys_checked >= 2_000);
+    assert!(report.pages_checked > 0);
+    assert!(report.overflow_pages_checked > 0);
+}
+
+#[test]
+fn online_integrity_check_detects_corruption() {
+    let _ = env_logger::try_init();
+    let _f = test_folder();
+    let mut env_opts = EnvOptions::new(_f.path());
+    env_opts.use_checksums = true;
+    let db = Database::with_options(env_opts, DbOptions::new()).unwrap();
+
+    let tx = db.begin_write().unwrap();
+    let mut tree = tx.get_or_create_tree(b"default").unwrap();
+    for i in 0..500u32 {
+        tree.insert(&i.to_be_bytes(), &[i as u8; 128]).unwrap();
+    }
+    drop(tree);
+    tx.commit().unwrap();
+    db.checkpoint().unwrap();
+
+    let rx = db.begin_read().unwrap();
+    let tree = rx.get_tree(b"default").unwrap().unwrap();
+    let mut pages = Vec::new();
+    tree.iter_pages(&mut |page_id, span| {
+        if !page_id.is_compressed() {
+            pages.push((page_id, span));
+        }
+    })
+    .unwrap();
+    drop(tree);
+    drop(rx);
+    assert!(!pages.is_empty());
+
+    let (page_id, _) = pages[pages.len() / 2];
+    let path = db.inner.opts.path.join("DATA");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let offset = page_id as u64 * PAGE_SIZE
+        + size_of::<ReservedPageHeader>() as u64
+        + size_of::<crate::repr::PageHeader>() as u64
+        + 32;
+    let mut byte = [0u8; 1];
+    file.read_exact_at(&mut byte, offset).unwrap();
+    byte[0] ^= 0x80;
+    file.write_all_at(&byte, offset).unwrap();
+
+    assert!(db.check_integrity().is_err());
+}
+
 fn test_folder() -> TempDir {
     if let Ok(p) = std::env::var("TEST_DATA_FOLDER") {
         let _ = std::fs::create_dir_all(&p);

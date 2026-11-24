@@ -31,6 +31,7 @@ Embedded Key-Value Storage Engine
 * **Write-Ahead Log (WAL)** - Optional WAL for efficient durable commits.
 * **Async durability** - Background WAL fsyncs for high throughput (e.g. every 500ms)
 * **Bounded recovery** - Predictable recovery times with periodic consistent checkpoints
+* **Online integrity checks** - Validate trees, pages, checksums and the freelist without stopping reads or writes
 
 ## When to Use Canopydb
 
@@ -172,6 +173,27 @@ let tx1 = db1.begin_write().unwrap();
 let tx2 = db2.begin_write().unwrap();
 // Use tx1 and tx2 here..
 env.group_commit([tx1, tx2], false).unwrap();
+```
+
+### Online Integrity Checks
+
+The database can be checked while it is serving reads and writes. The check runs against a
+stable read snapshot, so it does not block writers and the regular transaction semantics are
+unchanged. Corruption is returned as an error without halting the database.
+
+```rust
+let _dir = tempfile::tempdir().unwrap();
+let mut env_options = canopydb::EnvOptions::new(_dir.path());
+// Checksums make on-disk corruption detectable as well.
+env_options.use_checksums = true;
+let db = canopydb::Database::with_options(env_options, canopydb::DbOptions::new()).unwrap();
+
+// ... use the database normally ...
+
+match db.check_integrity() {
+    Ok(()) => println!("database is consistent"),
+    Err(error) => eprintln!("integrity problem: {error}"),
+}
 ```
 
 ## Benchmarks

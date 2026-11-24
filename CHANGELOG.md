@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added online database integrity checks (`Database::check_integrity`) that run against a
+  stable snapshot without blocking concurrent readers or writers.
+
 ## 0.2.0
 
 - Added support for Concurrent Write Transactions

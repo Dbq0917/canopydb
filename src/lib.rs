@@ -37,6 +37,7 @@ mod wal;
 mod repr;
 mod error;
 mod group_commit;
+mod integrity;
 mod shim;
 mod tree;
 mod write_batch;
@@ -79,6 +80,7 @@ pub use crate::{
     cursor::{RangeIter, RangeKeysIter},
     env::Environment,
     error::Error,
+    integrity::IntegrityReport,
     options::{DbOptions, EnvOptions, HaltCallbackFn, TreeOptions},
     tree::Tree,
 };
@@ -177,6 +179,27 @@ pub struct WriteTransaction(Transaction);
 /// Read-only transaction
 #[derive(Debug, Deref)]
 pub struct ReadTransaction(Transaction);
+
+impl ReadTransaction {
+    /// Checks the integrity of the snapshot held by this read transaction.
+    ///
+    /// The check only reads the snapshot, so it does not block or conflict with concurrent
+    /// readers and writers. See [`Database::check_integrity`] for details.
+    pub fn check_integrity(&self) -> Result<(), Error> {
+        integrity::check_read_transaction(&self.0).map(|_| ())
+    }
+
+    /// Checks the snapshot held by this read transaction and returns scan statistics.
+    pub fn check_integrity_report(&self) -> Result<IntegrityReport, Error> {
+        integrity::check_read_transaction(&self.0)
+    }
+
+    /// Alias for [`ReadTransaction::check_integrity`].
+    #[inline]
+    pub fn verify_integrity(&self) -> Result<(), Error> {
+        self.check_integrity()
+    }
+}
 
 /// Untyped Transaction
 ///
@@ -690,6 +713,55 @@ impl Database {
         if let Some(bg_thread) = bg_thread {
             let _ = bg_thread.join();
         }
+    }
+
+    /// Checks the integrity of the database while reads and writes continue to run.
+    ///
+    /// The check operates on a stable read snapshot. Concurrent transactions are not blocked
+    /// (except for a short period while the allocation limits are sampled) and the check does
+    /// not mutate the database, so the regular transaction semantics remain unchanged.
+    ///
+    /// All reachable trees are walked and their pages, node layouts, key ordering, separator
+    /// keys, overflow values and key counts are validated. Page checksums are verified when
+    /// present and the persistent freelist is parsed and validated.
+    ///
+    /// Returns [`Error::Io`] with an [`std::io::ErrorKind::InvalidData`] error when corruption
+    /// is found. The database is not halted, so the caller can decide whether to continue
+    /// serving or to take the database offline.
+    pub fn check_integrity(&self) -> Result<(), Error> {
+        integrity::check_integrity(&self.inner).map(|_| ())
+    }
+
+    /// Checks the integrity of the database and returns statistics about the scan.
+    ///
+    /// This is the same operation as [`Database::check_integrity`], but it also returns
+    /// counters that can be used for progress logging and operational monitoring.
+    pub fn check_integrity_report(&self) -> Result<IntegrityReport, Error> {
+        integrity::check_integrity(&self.inner)
+    }
+
+    /// Alias for [`Database::check_integrity`].
+    #[inline]
+    pub fn verify_integrity(&self) -> Result<(), Error> {
+        self.check_integrity()
+    }
+
+    /// Alias for [`Database::check_integrity`].
+    #[inline]
+    pub fn integrity_check(&self) -> Result<(), Error> {
+        self.check_integrity()
+    }
+
+    /// Alias for [`Database::check_integrity`].
+    #[inline]
+    pub fn verify(&self) -> Result<(), Error> {
+        self.check_integrity()
+    }
+
+    /// Alias for [`Database::check_integrity`].
+    #[inline]
+    pub fn check(&self) -> Result<(), Error> {
+        self.check_integrity()
     }
 
     #[cfg(any(fuzzing, test))]
@@ -1687,7 +1759,15 @@ impl Transaction {
 
     #[inline]
     fn read_clean_node(&self, id: PageId) -> Result<UntypedNode, Error> {
-        self.read_clean_node_opt(id, None, true)
+        self.read_clean_node_opt(id, None, true, true)
+    }
+
+    /// Read a node directly from its backing storage, bypassing the shared page cache.
+    ///
+    /// This is used by the online integrity checker so that it observes the bytes actually
+    /// written to the database file instead of a potentially stale in-memory copy.
+    fn read_clean_node_uncached(&self, id: PageId) -> Result<UntypedNode, Error> {
+        self.read_clean_node_opt(id, None, true, false)
     }
 
     fn read_clean_node_opt(
@@ -1695,6 +1775,7 @@ impl Transaction {
         id: PageId,
         mut redirect: Option<(TxId, (PageId, PageId))>,
         use_page_table: bool,
+        use_shared_cache: bool,
     ) -> Result<UntypedNode, Error> {
         trace!("read_clean_node {id}");
         debug_assert!(id > 1);
@@ -1710,8 +1791,10 @@ impl Transaction {
             };
         }
         let nck = NodeCacheKey::new(self.inner.env_db_id, redirect.map_or(0, |r| r.0), id);
-        if let Some(node) = self.inner.env.shared_cache.get(&nck) {
-            return Ok(node);
+        if use_shared_cache {
+            if let Some(node) = self.inner.env.shared_cache.get(&nck) {
+                return Ok(node);
+            }
         }
         let page = if id.is_compressed() {
             self.read_compressed_page_uncompressed(id, redirect.map(|r| r.1))?
@@ -1724,7 +1807,9 @@ impl Transaction {
         };
         let node = Node::from_page(page)?;
         debug_assert!(!node.dirty);
-        self.inner.env.shared_cache.insert(nck, node.clone());
+        if use_shared_cache {
+            self.inner.env.shared_cache.insert(nck, node.clone());
+        }
         Ok(node)
     }
 
@@ -1790,7 +1875,8 @@ impl Transaction {
         compressed_page: Option<(PageId, PageId)>,
     ) -> Result<UntypedNode, Error> {
         trace!("read_spilled_node {id} {compressed_page:?}");
-        let mut node = self.read_clean_node_opt(id, compressed_page.map(|a| (0, a)), false)?;
+        let mut node =
+            self.read_clean_node_opt(id, compressed_page.map(|a| (0, a)), false, true)?;
         let mut node_mut = node.make_dirty();
         if let Some((c_pid, c_span)) = compressed_page {
             debug_assert_eq!(node_mut.page_mut().compressed_page, Some((c_pid, c_span)));
@@ -2882,7 +2968,7 @@ impl DatabaseInner {
                     mem::transmute(bytes.as_slice_mut()),
                     at as u64 * PAGE_SIZE + size_of::<ReservedPageHeader>() as u64,
                 )
-                .unwrap();
+                .map_err(|e| io_invalid_data!("Error reading page {id} at {at}: {e}"))?;
             bytes.assume_init()
         };
 
@@ -2912,7 +2998,9 @@ impl DatabaseInner {
 
         let page = Page::from_bytes(bytes)?;
 
-        if self.opts.env.use_checksums && page.check_checksum() == Some(false) {
+        // Verify any page that carries a checksum. This also detects corruption if checksums
+        // were enabled when the page was written but have since been disabled in the options.
+        if page.check_checksum() == Some(false) {
             return Err(io_invalid_data!("Checksum mismatch for page {id}"));
         }
 
